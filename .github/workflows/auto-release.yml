@@ -1,9 +1,7 @@
 name: Criar Release
 
 on:
-  push:
-    branches:
-      - main
+  workflow_call:
 
 jobs:
   create-release:
