@@ -1,0 +1,18 @@
+name: Criar Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Criar Release
+        uses: kempdec/autorelease-action@v2
+        env:
+          AutoRelease_Token: ${{ secrets.GITHUB_TOKEN }}
