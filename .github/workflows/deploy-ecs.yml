@@ -1,0 +1,232 @@
+name: Publicar API no ECS
+
+on:
+  workflow_call:
+    inputs:
+      api:
+        description: mobile, web, nosql ou ia
+        required: true
+        type: string
+      aws-account-id:
+        description: Conta AWS que recebera o deploy
+        required: true
+        type: string
+      aws-region:
+        default: us-east-1
+        type: string
+      ecs-cluster:
+        default: cluster-fixa
+        type: string
+      task-definition:
+        description: Revisao opcional para aplicar configuracoes criadas pelo Terraform
+        default: ''
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_SESSION_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: ecs-${{ inputs.aws-account-id }}-${{ inputs.ecs-cluster }}-${{ inputs.api }}
+      cancel-in-progress: false
+    env:
+      API: ${{ inputs.api }}
+      AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+      AWS_REGION: ${{ inputs.aws-region }}
+      ECS_CLUSTER: ${{ inputs.ecs-cluster }}
+      CONFIG_TASK_DEFINITION: ${{ inputs.task-definition }}
+      AWS_PAGER: ''
+      AWS_RETRY_MODE: standard
+      AWS_MAX_ATTEMPTS: '5'
+    steps:
+      - name: Obter o commit da API que chamou o workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Definir destino e imagem
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$API:$GITHUB_REPOSITORY" in
+            mobile:Fixa-Inter/segundo-api-app|web:Fixa-Inter/segundo-api-web|nosql:Fixa-Inter/segundo-api-nosql|ia:Fixa-Inter/segundo-inteligencia-artificial) ;;
+            *) echo 'API e repositorio nao correspondem.' >&2; exit 1 ;;
+          esac
+          [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          [[ "$AWS_REGION" == us-east-1 ]]
+          echo "ECR_REPOSITORY=fixa/$API-api" >> "$GITHUB_ENV"
+          echo "ECS_SERVICE=fixa-$API-api-service" >> "$GITHUB_ENV"
+          echo "CONTAINER_NAME=fixa-$API-api" >> "$GITHUB_ENV"
+          echo "REGISTRY=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=sha-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Autenticar na AWS com a sessao do laboratorio
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Obter a configuracao do servico existente
+        shell: bash
+        run: |
+          set -euo pipefail
+          account=$(aws sts get-caller-identity --query Account --output text)
+          [[ "$account" == "$AWS_ACCOUNT_ID" ]] || {
+            echo 'As credenciais pertencem a outra conta AWS.' >&2
+            exit 1
+          }
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" > service.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          result = json.loads(Path('service.json').read_text())
+          if result.get('failures') or len(result.get('services', [])) != 1:
+              raise SystemExit('Servico ECS nao encontrado.')
+          service = result['services'][0]
+          if service['status'] != 'ACTIVE' or service['desiredCount'] < 1:
+              raise SystemExit('O servico precisa estar ativo e com desiredCount maior que zero.')
+          if service.get('deploymentController', {}).get('type', 'ECS') != 'ECS':
+              raise SystemExit('Este workflow requer deployment controller ECS.')
+          arn = os.environ['CONFIG_TASK_DEFINITION'] or service['taskDefinition']
+          # Evita inserir linhas arbitrarias no arquivo de ambiente do runner.
+          if '\n' in arn or '\r' in arn:
+              raise SystemExit('Task Definition invalida.')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'SOURCE_TASK_DEFINITION={arn}\n')
+          PY
+
+      - name: Carregar a Task Definition de origem
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$SOURCE_TASK_DEFINITION" --include TAGS > current-task.json
+
+      - name: Construir e publicar a imagem
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+          image="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          if [[ "$API" == mobile ]]; then
+            base_image="fixa-mobile-build:$IMAGE_TAG"
+            docker build --platform linux/amd64 -t "$base_image" .
+            docker build --platform linux/amd64 \
+              --build-arg "BASE_IMAGE=$base_image" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              -t "$image" .aws/mobile
+          else
+            docker build --platform linux/amd64 \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              -t "$image" .
+          fi
+          docker push "$image"
+          digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "DEPLOY_IMAGE=$REGISTRY/$ECR_REPOSITORY@$digest" >> "$GITHUB_ENV"
+
+      - name: Preparar a nova Task Definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          source = json.loads(Path('current-task.json').read_text())
+          task = source['taskDefinition']
+          if task['family'] != os.environ['CONTAINER_NAME']:
+              raise SystemExit('Familia da Task Definition diferente da API selecionada.')
+          containers = [c for c in task['containerDefinitions'] if c['name'] == os.environ['CONTAINER_NAME']]
+          if len(containers) != 1:
+              raise SystemExit('Container esperado nao encontrado de forma unica.')
+          container = containers[0]
+          if os.environ['API'] == 'mobile':
+              keys = {x['name'] for x in container.get('environment', []) + container.get('secrets', [])}
+              required = {'FIREBASE_CREDENTIALS_PATH', 'FIREBASE_S3_BUCKET', 'FIREBASE_S3_KEY',
+                          'FIREBASE_S3_BUCKET_OWNER', 'FIREBASE_CREDENTIALS_SHA256', 'FIREBASE_PROJECT_ID'}
+              if not required <= keys:
+                  raise SystemExit('Task Definition Mobile sem as referencias Firebase do deploy inicial.')
+          container['image'] = os.environ['DEPLOY_IMAGE']
+          # Campos aceitos por RegisterTaskDefinition; metadados de leitura ficam de fora.
+          allowed = {'family', 'taskRoleArn', 'executionRoleArn', 'networkMode', 'containerDefinitions',
+                     'volumes', 'placementConstraints', 'requiresCompatibilities', 'cpu', 'memory',
+                     'pidMode', 'ipcMode', 'proxyConfiguration', 'inferenceAccelerators',
+                     'ephemeralStorage', 'runtimePlatform', 'enableFaultInjection'}
+          result = {k: v for k, v in task.items() if k in allowed}
+          tags = [t for t in source.get('tags', []) if not t['key'].startswith('aws:')]
+          if tags:
+              result['tags'] = tags
+          Path('task-definition.json').write_text(json.dumps(result))
+          PY
+
+      - name: Implantar a nova revisao no ECS
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/main | cut -f1)
+          [[ "$latest" == "$GITHUB_SHA" ]] || {
+            echo 'Existe um commit mais recente na main; esta execucao antiga nao sera implantada.' >&2
+            exit 1
+          }
+          arn=$(aws ecs register-task-definition --cli-input-json file://task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "EXPECTED_TASK_DEFINITION=$arn" >> "$GITHUB_ENV"
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$arn" --query 'service.serviceArn' --output text
+
+      - name: Aguardar e confirmar a revisao publicada
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" > deployed-service.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          result = json.loads(Path('deployed-service.json').read_text())
+          if result.get('failures') or len(result.get('services', [])) != 1:
+              raise SystemExit('Servico nao encontrado depois do deploy.')
+          service = result['services'][0]
+          expected = os.environ['EXPECTED_TASK_DEFINITION']
+          deployments = service.get('deployments', [])
+          healthy = (service['taskDefinition'] == expected
+                     and service['desiredCount'] > 0
+                     and service['runningCount'] == service['desiredCount']
+                     and service['pendingCount'] == 0
+                     and len(deployments) == 1
+                     and deployments[0]['taskDefinition'] == expected
+                     and deployments[0].get('rolloutState') == 'COMPLETED')
+          if not healthy:
+              raise SystemExit('A revisao solicitada nao concluiu o deploy; verifique rollback/eventos ECS.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write(f"### Deploy concluido: {os.environ['API']}\n\n"
+                           f"Commit: `{os.environ['GITHUB_SHA']}`\n\n"
+                           f"Imagem: `{os.environ['DEPLOY_IMAGE']}`\n\n"
+                           f"Task Definition: `{expected}`\n")
+          PY
+
+      - name: Mostrar eventos ECS em caso de falha
+        if: failure() && steps.deploy.outcome != 'skipped'
+        continue-on-error: true
+        shell: bash
+        run: |
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].events[:10].[createdAt,message]' --output table
