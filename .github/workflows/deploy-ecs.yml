@@ -196,31 +196,94 @@ jobs:
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
-          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" > deployed-service.json
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
           python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          result = json.loads(Path('deployed-service.json').read_text())
-          if result.get('failures') or len(result.get('services', [])) != 1:
-              raise SystemExit('Servico nao encontrado depois do deploy.')
-          service = result['services'][0]
-          expected = os.environ['EXPECTED_TASK_DEFINITION']
-          deployments = service.get('deployments', [])
-          healthy = (service['taskDefinition'] == expected
-                     and service['desiredCount'] > 0
-                     and service['runningCount'] == service['desiredCount']
-                     and service['pendingCount'] == 0
-                     and len(deployments) == 1
-                     and deployments[0]['taskDefinition'] == expected
-                     and deployments[0].get('rolloutState') == 'COMPLETED')
-          if not healthy:
-              raise SystemExit('A revisao solicitada nao concluiu o deploy; verifique rollback/eventos ECS.')
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
-              output.write(f"### Deploy concluido: {os.environ['API']}\n\n"
-                           f"Commit: `{os.environ['GITHUB_SHA']}`\n\n"
-                           f"Imagem: `{os.environ['DEPLOY_IMAGE']}`\n\n"
-                           f"Task Definition: `{expected}`\n")
+          import json
+          import os
+          import subprocess
+          import time
+
+          expected = os.environ["EXPECTED_TASK_DEFINITION"]
+          confirmed = False
+
+          for attempt in range(1, 19):
+              response = subprocess.check_output(
+                  [
+                      "aws", "ecs", "describe-services",
+                      "--cluster", os.environ["ECS_CLUSTER"],
+                      "--services", os.environ["ECS_SERVICE"],
+                      "--output", "json",
+                      "--no-cli-pager",
+                  ],
+                  text=True,
+              )
+              result = json.loads(response)
+
+              if result.get("failures") or len(result.get("services", [])) != 1:
+                  raise SystemExit("Servico nao encontrado depois do deploy.")
+
+              service = result["services"][0]
+              deployments = service.get("deployments", [])
+
+              healthy = (
+                  service["taskDefinition"] == expected
+                  and service["desiredCount"] > 0
+                  and service["runningCount"] == service["desiredCount"]
+                  and service["pendingCount"] == 0
+                  and len(deployments) == 1
+                  and deployments[0]["taskDefinition"] == expected
+                  and deployments[0].get("rolloutState") == "COMPLETED"
+              )
+
+              diagnostic = {
+                  "tentativa": attempt,
+                  "revisaoEsperada": expected,
+                  "revisaoAtual": service["taskDefinition"],
+                  "desired": service["desiredCount"],
+                  "running": service["runningCount"],
+                  "pending": service["pendingCount"],
+                  "deployments": [
+                      {
+                          "revisao": deployment["taskDefinition"],
+                          "estado": deployment.get("rolloutState"),
+                          "motivo": deployment.get("rolloutStateReason"),
+                      }
+                      for deployment in deployments
+                  ],
+              }
+              print(json.dumps(diagnostic, ensure_ascii=False), flush=True)
+
+              if healthy:
+                  confirmed = True
+                  break
+
+              if any(
+                  deployment["taskDefinition"] == expected
+                  and deployment.get("rolloutState") == "FAILED"
+                  for deployment in deployments
+              ):
+                  raise SystemExit("O ECS marcou a revisao solicitada como FAILED.")
+
+              if attempt < 18:
+                  time.sleep(10)
+
+          if not confirmed:
+              raise SystemExit(
+                  "A revisao solicitada nao concluiu o deploy no prazo. "
+                  "Consulte o diagnostico acima e os eventos ECS."
+              )
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(
+                  f"### Deploy concluido: {os.environ['API']}\n\n"
+                  f"Commit: `{os.environ['GITHUB_SHA']}`\n\n"
+                  f"Imagem: `{os.environ['DEPLOY_IMAGE']}`\n\n"
+                  f"Task Definition: `{expected}`\n"
+              )
           PY
 
       - name: Mostrar eventos ECS em caso de falha
