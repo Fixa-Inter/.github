@@ -149,6 +149,10 @@ jobs:
                   raise SystemExit('Task Definition sem Task Role para baixar a credencial do S3.')
               # Garante o inicializador mesmo se a revisao de origem sobrescrever o ENTRYPOINT.
               container['entryPoint'] = ['python3', '/usr/local/bin/fixa-firebase-entrypoint.py']
+              container['command'] = [
+                  'sh', '-c',
+                  'exec java -Dserver.port=${PORT:-8080} -jar /app/app.jar'
+              ]
           # Campos aceitos por RegisterTaskDefinition; metadados de leitura ficam de fora.
           allowed = {'family', 'taskRoleArn', 'executionRoleArn', 'networkMode', 'containerDefinitions',
                      'volumes', 'placementConstraints', 'requiresCompatibilities', 'cpu', 'memory',
