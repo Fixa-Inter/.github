@@ -115,32 +115,6 @@ jobs:
           set -euo pipefail
           aws ecs describe-task-definition --task-definition "$SOURCE_TASK_DEFINITION" --include TAGS > current-task.json
 
-      - name: Construir e publicar a imagem
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
-          image="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          if [[ "$API" == mobile ]]; then
-            base_image="fixa-mobile-build:$IMAGE_TAG"
-            docker build --platform linux/amd64 -t "$base_image" .
-            docker build --platform linux/amd64 \
-              --build-arg "BASE_IMAGE=$base_image" \
-              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-              -t "$image" .aws/mobile
-          else
-            docker build --platform linux/amd64 \
-              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-              -t "$image" .
-          fi
-          docker push "$image"
-          digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
-            --image-ids "imageTag=$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)
-          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
-          echo "DEPLOY_IMAGE=$REGISTRY/$ECR_REPOSITORY@$digest" >> "$GITHUB_ENV"
-
       - name: Preparar a nova Task Definition
         shell: bash
         run: |
@@ -156,13 +130,25 @@ jobs:
           if len(containers) != 1:
               raise SystemExit('Container esperado nao encontrado de forma unica.')
           container = containers[0]
-          if os.environ['API'] == 'mobile':
-              keys = {x['name'] for x in container.get('environment', []) + container.get('secrets', [])}
+          if os.environ['API'] in ('mobile', 'web', 'nosql'):
+              environment = {x['name']: x.get('value', '') for x in container.get('environment', [])}
+              secrets = {x['name']: x.get('valueFrom', '') for x in container.get('secrets', [])}
               required = {'FIREBASE_CREDENTIALS_PATH', 'FIREBASE_S3_BUCKET', 'FIREBASE_S3_KEY',
                           'FIREBASE_S3_BUCKET_OWNER', 'FIREBASE_CREDENTIALS_SHA256', 'FIREBASE_PROJECT_ID'}
-              if not required <= keys:
-                  raise SystemExit('Task Definition Mobile sem as referencias Firebase do deploy inicial.')
-          container['image'] = os.environ['DEPLOY_IMAGE']
+              missing = sorted(key for key in required if not environment.get(key) and not secrets.get(key))
+              if missing:
+                  raise SystemExit('Task Definition ' + os.environ['API'] + ' sem referencias Firebase: '
+                                   + ', '.join(missing) + '. Aplique a configuracao Firebase pelo Terraform '
+                                   + 'e informe essa revisao no input task-definition.')
+              path = environment.get('FIREBASE_CREDENTIALS_PATH')
+              if path and path != '/app/secrets/firebase.json':
+                  raise SystemExit('FIREBASE_CREDENTIALS_PATH: configure /app/secrets/firebase.json')
+              if environment.get('FIREBASE_CREDENTIALS_JSON') or secrets.get('FIREBASE_CREDENTIALS_JSON'):
+                  raise SystemExit('Remova FIREBASE_CREDENTIALS_JSON; este runtime usa o arquivo privado no S3.')
+              if not task.get('taskRoleArn'):
+                  raise SystemExit('Task Definition sem Task Role para baixar a credencial do S3.')
+              # Garante o inicializador mesmo se a revisao de origem sobrescrever o ENTRYPOINT.
+              container['entryPoint'] = ['python3', '/usr/local/bin/fixa-firebase-entrypoint.py']
           # Campos aceitos por RegisterTaskDefinition; metadados de leitura ficam de fora.
           allowed = {'family', 'taskRoleArn', 'executionRoleArn', 'networkMode', 'containerDefinitions',
                      'volumes', 'placementConstraints', 'requiresCompatibilities', 'cpu', 'memory',
@@ -173,6 +159,150 @@ jobs:
           if tags:
               result['tags'] = tags
           Path('task-definition.json').write_text(json.dumps(result))
+          PY
+
+      - name: Criar runtime Firebase compartilhado
+        if: inputs.api == 'mobile' || inputs.api == 'web' || inputs.api == 'nosql'
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_dir=$(mktemp -d "$RUNNER_TEMP/fixa-firebase.XXXXXX")
+          cat > "$runtime_dir/Dockerfile" <<'DOCKERFILE'
+          # Runtime Firebase compartilhado por mobile, web e nosql sobre a imagem Java original.
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          USER root
+          RUN apk add --no-cache python3 py3-boto3 \
+              && addgroup -S fixa \
+              && adduser -S -G fixa fixa \
+              && mkdir -p /app/secrets \
+              && chown fixa:fixa /app/secrets \
+              && chmod 700 /app/secrets
+          COPY entrypoint.py /usr/local/bin/fixa-firebase-entrypoint.py
+          USER fixa
+          ENTRYPOINT ["python3", "/usr/local/bin/fixa-firebase-entrypoint.py"]
+          CMD ["sh", "-c", "exec java -Dserver.port=${PORT:-8080} -jar /app/app.jar"]
+          DOCKERFILE
+          cat > "$runtime_dir/entrypoint.py" <<'PYTHON'
+          """Baixa a credencial privada para disco efemero antes de iniciar o Java."""
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import tempfile
+
+          CREDENTIAL_PATH = '/app/secrets/firebase.json'
+          MAX_BYTES = 128 * 1024
+
+
+          def prepare_firebase(env, s3):
+              path = env.get('FIREBASE_CREDENTIALS_PATH')
+              if path != CREDENTIAL_PATH or env.get('FIREBASE_CREDENTIALS_JSON'):
+                  raise RuntimeError('Configuracao Firebase incompativel')
+              owner = env.get('FIREBASE_S3_BUCKET_OWNER', '')
+              digest = env.get('FIREBASE_CREDENTIALS_SHA256', '')
+              if not re.fullmatch(r'[0-9]{12}', owner) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+                  raise RuntimeError('Identidade/checksum Firebase invalidos')
+              bucket = env.get('FIREBASE_S3_BUCKET')
+              key = env.get('FIREBASE_S3_KEY')
+              if bucket != f'fixa-secrets-{owner}-us-east-1' or key != f'firebase/{digest}.json':
+                  raise RuntimeError('Destino Firebase inesperado')
+              response = s3.get_object(Bucket=bucket, Key=key, ExpectedBucketOwner=owner)
+              body = response['Body']
+              try:
+                  raw = body.read(MAX_BYTES + 1)
+              finally:
+                  body.close()
+              if len(raw) > MAX_BYTES or hashlib.sha256(raw).hexdigest() != digest:
+                  raise RuntimeError('Integridade da credencial Firebase nao confirmada')
+              data = json.loads(raw.decode('utf-8-sig'))
+              if not isinstance(data,dict) or data.get('type') != 'service_account':
+                  raise RuntimeError('Credencial Firebase invalida')
+              for key in ('project_id','client_email','private_key'):
+                  if not isinstance(data.get(key),str) or not data[key].strip():
+                      raise RuntimeError('Credencial Firebase incompleta')
+              if data['project_id'] != env.get('FIREBASE_PROJECT_ID'):
+                  raise RuntimeError('Projeto Firebase divergente')
+              if '-----BEGIN PRIVATE KEY-----' not in data['private_key'] or '-----END PRIVATE KEY-----' not in data['private_key']:
+                  raise RuntimeError('Formato da credencial Firebase invalido')
+              target = Path(path)
+              target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+              target.parent.chmod(0o700)
+              fd, temp = tempfile.mkstemp(dir=target.parent)
+              try:
+                  with os.fdopen(fd,'wb') as f:
+                      f.write(raw)
+                  os.replace(temp,target)
+              finally:
+                  if os.path.exists(temp):
+                      os.unlink(temp)
+
+
+          def main():
+              os.umask(0o077)
+              import boto3
+              s3 = boto3.client('s3',region_name='us-east-1')
+              prepare_firebase(os.environ,s3)
+              print('[OK] Credencial Firebase preparada; iniciando API.',flush=True)
+              if len(sys.argv) < 2:
+                  raise RuntimeError('Comando Java ausente')
+              os.execvp(sys.argv[1],sys.argv[1:])
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception:
+                  # Nem resposta S3, nem arquivo, nem excecoes do SDK sao enviados ao log.
+                  print('[ERRO] Nao foi possivel preparar Firebase. Verifique arquivo, checksum e permissoes S3 da Task Role. API nao iniciada.',file=sys.stderr)
+                  sys.exit(1)
+          PYTHON
+          cat > "$runtime_dir/.dockerignore" <<'DOCKERIGNORE'
+          *
+          !Dockerfile
+          !entrypoint.py
+          DOCKERIGNORE
+          echo "FIREBASE_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+
+      - name: Construir e publicar a imagem
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+          image="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          if [[ "$API" == mobile || "$API" == web || "$API" == nosql ]]; then
+            base_image="fixa-$API-build:$IMAGE_TAG"
+            docker build --platform linux/amd64 -t "$base_image" .
+            docker build --platform linux/amd64 \
+              --build-arg "BASE_IMAGE=$base_image" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              -t "$image" "$FIREBASE_RUNTIME_DIR"
+          else
+            docker build --platform linux/amd64 \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              -t "$image" .
+          fi
+          docker push "$image"
+          digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "DEPLOY_IMAGE=$REGISTRY/$ECR_REPOSITORY@$digest" >> "$GITHUB_ENV"
+
+      - name: Associar a imagem publicada a Task Definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path('task-definition.json')
+          task = json.loads(path.read_text())
+          container = next(c for c in task['containerDefinitions'] if c['name'] == os.environ['CONTAINER_NAME'])
+          container['image'] = os.environ['DEPLOY_IMAGE']
+          path.write_text(json.dumps(task))
           PY
 
       - name: Implantar a nova revisao no ECS
