@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.gif" width="100%" alt="FIXA — Gestão consciente para manutenção inteligente, com elementos ilustrados em movimento suave.">
+  <img src=""C:\Users\alinesilva-ieg\Downloads\banner.gif"" width="100%" alt="FIXA — Gestão consciente para manutenção inteligente, com elementos ilustrados em movimento suave.">
 </p>
 
 <p align="center">
@@ -39,7 +39,7 @@ O **FIXA** centraliza esse processo. A plataforma conecta solicitantes, técnico
 | Etapa | O que acontece |
 | --- | --- |
 | **1. Solicitar** | O usuário descreve o problema, informa o local e pode anexar imagens. |
-| **2. Validar e priorizar** | O gestor revisa a demanda; a IA pode apoiar a categorização, a prioridade e a recomendação de técnico. |
+| **2. Validar e priorizar** | O gestor revisa a demanda. |
 | **3. Planejar** | A solicitação validada entra no fluxo de trabalho, recebe responsável e pode ser agendada no calendário. |
 | **4. Executar** | O técnico acompanha a ordem de serviço no Kanban, atualiza o status e registra ocorrências ou imprevistos. |
 | **5. Concluir** | A solução aplicada e pelo menos uma evidência fotográfica ficam registradas para consulta e indicadores. |
@@ -51,7 +51,6 @@ flowchart LR
     C --> D[Técnico executa]
     D --> E[Evidências e conclusão]
     E --> F[Histórico e indicadores]
-    B -. apoio .-> G[IA: categoria, prioridade e recomendação]
     G -. sugestão .-> C
 ```
 
