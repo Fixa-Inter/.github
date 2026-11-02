@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="./assets/banner.gif" width="100%" alt="FIXA — Gestão consciente para manutenção inteligente, com elementos ilustrados em movimento suave.">
+  <img src="./assets/banner.gif" width="100%" alt="FIXA: Gestão consciente para manutenção inteligente">
 </p>
 
 <p align="center">
-  <a href="#o-fixa">O FIXA</a> ·
+  <a href="#o-fixa">FIXA</a> ·
   <a href="#como-funciona">Como funciona</a> ·
   <a href="#para-cada-perfil">Perfis</a> ·
   <a href="#ecossistema">Ecossistema</a> ·
