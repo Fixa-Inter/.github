@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=""C:\Users\alinesilva-ieg\Downloads\banner.gif"" width="100%" alt="FIXA — Gestão consciente para manutenção inteligente, com elementos ilustrados em movimento suave.">
+  <img src="./assets/banner.gif" width="100%" alt="FIXA — Gestão consciente para manutenção inteligente, com elementos ilustrados em movimento suave.">
 </p>
 
 <p align="center">
